@@ -1,0 +1,13 @@
+{
+  "name": "agents-pane",
+  "version": "0.1.0",
+  "description": "A strip above the prompt while subagents run, opening a pane that tracks each one's status, tools, tokens and time.",
+  "author": {
+    "name": "desmondlee95700",
+    "url": "https://github.com/desmondlee95700"
+  },
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/desmondlee95700/claude-mod/tree/main/plugins/agents-pane",
+  "repository": "https://github.com/desmondlee95700/claude-mod",
+  "license": "MIT"
+}

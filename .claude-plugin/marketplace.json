@@ -1,0 +1,14 @@
+{
+  "name": "claude-mod",
+  "owner": { "name": "desmondlee95700", "url": "https://github.com/desmondlee95700" },
+  "metadata": { "description": "desmondlee95700's public Claude Code mods." },
+  "plugins": [
+    {
+      "name": "agents-pane",
+      "source": "./plugins/agents-pane",
+      "description": "Mod: Team Claude. A strip above the prompt while subagents run and a pane that tracks each one's status, tools, tokens and time.",
+      "version": "0.1.0",
+      "category": "mod"
+    }
+  ]
+}
