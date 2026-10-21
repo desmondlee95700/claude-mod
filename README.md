@@ -4,7 +4,23 @@ My public Claude Code mods, in one place. Every item is a standalone plugin unde
 
 | Plugin | Type | What it does |
 |---|---|---|
-| agents-pane | mod | 🏀 Team Claude: a strip above the prompt while subagents run, and a pane (`/agents-pane`) that tracks each one's status, tools, tokens and time. Every subagent suits up as a numbered pixel player. |
+| agents-pane | mod | ✦ Astral Express: every subagent boards as a Honkai: Star Rail pixel hero. A strip above the prompt shows the Astral Express riding the star rail with the working heroes in its windows, and a pane (`/agents-pane`) plays each hero's kit while it tracks status, tools, tokens and time. |
+
+## agents-pane: the Astral Express
+
+Each subagent takes the next hero in the roster, or the hero its description names ("Firefly …"). While it works, its card loops the hero's kit, each move named as it plays:
+
+| Hero | Path | Basic ATK | Skill | Ultimate |
+|---|---|---|---|---|
+| Dan Heng • Imbibitor Lunae | Destruction | Beneficent Lotus: water slashes | Transcendence: dragon scales and a spear thrust | Azure's Aqua Ablutes All: full moon and the azure dragon |
+| Dan Heng • Permansor Terrae | Preservation | Aegis Vitae: a gauntlet strike | Terra Omnibus: a golden shield, Bondmate and Souldragon | A Dragon's Zenith Knows No Rue: the golden dragon dives into a shockwave |
+| Castorice | Remembrance | Lament, Nethersea's Ripple | Silence, Wraithfly's Caress: wraithflies | Doomshriek, Dawn's Chime: Netherwing over the Lost Netherland |
+| Firefly | Destruction | Order: Flare Propulsion | Order: Aerial Bombardment | Complete Combustion: SAM's green flame wings |
+
+Firefly fights as SAM, her armor, and is herself again once her work is done.
+
+Above the prompt the Astral Express rides the star rail with one carriage window per working subagent, up to four; with none at work it waits on the rail. The pane opens on a board styled after Star Rail's battle screen: the action order with the working heroes' faces, trailblaze time, victories and defeats, a skill point for each hero at work, and tokens. In a terminal the heroes are drawn in half-block characters.
+
 ## Install
 
 ### From the marketplace
@@ -60,4 +76,6 @@ Check a plugin before publishing: `claude plugin validate plugins/<name>`, and t
 
 ## License
 
-MIT
+MIT for the code.
+
+The pixel heroes are unofficial fan art of Honkai: Star Rail characters. This project is not affiliated with or endorsed by HoYoverse; Honkai: Star Rail and its characters belong to COGNOSPHERE / HoYoverse.

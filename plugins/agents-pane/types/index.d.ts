@@ -12,7 +12,7 @@ export type AgentRow = {
   tools: number
   lastTool: string | null
   tokens: number
-  /** Roster spot on Team Claude: picks the jersey number and gear. Absent on rows from before the team. */
+  /** Roster spot on the Astral Express: picks the hero. Absent on rows from before the roster. */
   player?: number
 }
 

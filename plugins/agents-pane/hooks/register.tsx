@@ -2,14 +2,18 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { AgentRow, AgentStatus } from '../types'
+import { H, W, bigSprite, bustOf, heroNamed, heroOf, hex, pixelsOf } from './cast'
+import type { Hero } from './cast'
 
 const PANE = 'agents'
 const agents = atom({ plugin: 'agents-pane', key: 'agents' } as const, [])
 const isStripHidden = atom({ plugin: 'agents-pane', key: 'isStripHidden' } as const, false)
 // True while the pane is drawn; the strip steps aside then.
 const isPaneUp = atom({ plugin: 'agents-pane', key: 'isPaneUp' } as const, false)
-// Bumped each second while anyone is on court, so the game clocks tick.
+// Bumped each second while anyone is in battle, so the battle clocks tick.
 const tick = atom({ plugin: 'agents-pane', key: 'tick' } as const, 0)
+// The next roster spot: each subagent boards the Astral Express as the next hero in line.
+const signed = atom({ plugin: 'agents-pane', key: 'signed' } as const, 0)
 
 const STATUS_COLOR: Record<AgentStatus, string> = {
   running: 'success',
@@ -19,77 +23,291 @@ const STATUS_COLOR: Record<AgentStatus, string> = {
 }
 const STATUS_MARK: Record<AgentStatus, string> = {
   running: '●',
-  done: '✓',
+  done: '✦',
   stopped: '■',
   failed: '✗',
 }
 const STATUS_LABEL: Record<AgentStatus, string> = {
-  running: 'ON COURT',
-  done: 'FINAL',
-  stopped: 'BENCHED',
-  failed: 'FOULED OUT',
+  running: 'IN BATTLE',
+  done: 'VICTORY',
+  stopped: 'RETREATED',
+  failed: 'DEFEATED',
 }
 
-// Team Claude: each subagent signs on as a pixel player, 18×16, with its own number and gear.
-const signed = atom({ plugin: 'agents-pane', key: 'signed' } as const, 0)
+type Key = [t: number, x: number, y: number]
 
-const W = 18
-const H = 16
-const PALETTE: Record<string, number> = {
-  o: 0xd97757, // body
-  k: 0x1a1a1a, // eyes, seams
-  j: 0x2b4fb3, // jersey
-  s: 0x1d3784, // shorts
-  t: 0xf5f5f5, // collar trim
-  n: 0xffffff, // number
-  w: 0xffffff, // headband, wristbands
-  c: 0xc8342b, // cap
-  g: 0x3a3a3a, // goggle frame
-  e: 0x7fd3ff, // goggle lens
-  y: 0xf2c12e, // crown
-  r: 0xc8342b, // gems, ear cups
-  b: 0xe07020, // ball
-  a: 0x3b2314, // afro
+function motion(keys: Key[], total: number, begin = 0): string {
+  const times = keys.map(([t]) => (t / total).toFixed(4)).join(';')
+  const values = keys.map(([, x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join(';')
+  return `<animateTransform attributeName="transform" type="translate" values="${values}" keyTimes="${times}" dur="${total.toFixed(2)}s" begin="${begin.toFixed(2)}s" repeatCount="indefinite"/>`
 }
 
-// '.' leaves the pixel as it is, ' ' clears it.
-const BODY = [
-  '',
-  '',
-  '',
-  '...oooooooooo',
-  '...okooooooko',
-  '...oooooooooo',
-  '...jjjttttjjj',
-  '.oojjjjjjjjjjoo',
-  '.oojjjjjjjjjjoo',
-  '...jjjjjjjjjj',
-  '...jjjjjjjjjj',
-  '...jjjjjjjjjj',
-  '...ssssssssss',
-  '...ssssssssss',
-  '....o.o..o.o',
-  '....o.o..o.o',
+// Shown only between `from` and `to` (seconds) of each loop.
+function blink(from: number, to: number, total: number): string {
+  const a = Math.max(0, from / total).toFixed(4)
+  const b = Math.min(1, to / total).toFixed(4)
+  return `<animate attributeName="opacity" values="0;1;0" keyTimes="0;${a};${b}" calcMode="discrete" dur="${total.toFixed(2)}s" repeatCount="indefinite"/>`
+}
+
+function fade(values: string, total: number, begin = 0): string {
+  return `<animate attributeName="opacity" values="${values}" dur="${total.toFixed(2)}s" begin="${begin.toFixed(2)}s" repeatCount="indefinite"/>`
+}
+
+const px = (x: number, y: number, size: number, color: number, extra = '') =>
+  `<rect x="${x}" y="${y}" width="${size}" height="${size}" fill="${hex(color)}"${extra}/>`
+
+const STAR = (x: number, y: number, color: number) =>
+  px(x, y - 1, 1, color) + px(x - 1, y, 1, color) + px(x, y, 1, 0xffffff) + px(x + 1, y, 1, color) + px(x, y + 1, 1, color)
+
+// A detailed hero (or SAM) in a nested box, clipped to `view` ("x y w h" of the 32×40 sprite).
+function bust(name: string, x: number, y: number, w: number, h: number, view = '4 2 24 15'): string {
+  const [, top, , rows] = view.split(' ').map(Number)
+  return `<svg x="${x}" y="${y}" width="${w}" height="${h}" viewBox="${view.replace(/^(\S+) \S+/, '$1 0')}" overflow="hidden">${bustOf(name, top, rows)}</svg>`
+}
+
+// The strip: the Astral Express riding the star rail, one carriage window per working subagent (up to four).
+const SCENE_H = 44
+const CAR_W = 30
+const LOCO_W = 40
+
+function train(party: Hero[], isMoving: boolean): { source: string; width: number } {
+  const n = Math.max(1, party.length)
+  const x0 = 6
+  const loco = x0 + n * (CAR_W + 2)
+  const width = loco + LOCO_W + 10
+  const anim = (inner: string, keys: Key[], total: number) => (isMoving ? `<g>${motion(keys, total)}${inner}</g>` : inner)
+
+  const STARS = [[9, 4], [23, 9], [41, 3], [57, 7], [74, 2], [88, 10], [103, 5], [121, 8], [137, 3], [152, 9], [169, 4], [186, 7], [201, 2], [218, 6]]
+  const field = STARS.filter(([x]) => x! < width)
+    .map(([x, y], i) => `<rect x="${x}" y="${y}" width="${i % 3 ? 1 : 1.5}" height="${i % 3 ? 1 : 1.5}" fill="#ffffff" opacity="${i % 2 ? 0.45 : 0.8}"/>`)
+    .join('')
+  const sky = isMoving ? anim(field + `<g transform="translate(${width} 0)">${field}</g>`, [[0, 0, 0], [8, -width, 0]], 8) : field
+
+  const sleepers = Array.from({ length: Math.ceil(width / 5) + 2 }, (_, i) => `<rect x="${i * 5}" y="41" width="2" height="1" fill="#6b5630"/>`).join('')
+  const rail = `<rect x="0" y="40" width="${width}" height="1" fill="#c9a24a"/>` + anim(sleepers, [[0, 0, 0], [0.25, -5, 0]], 0.25)
+
+  const wheel = (cx: number, cy: number, r: number) =>
+    `<g transform="translate(${cx} ${cy})"><circle r="${r}" fill="#25263a" stroke="#c9a24a" stroke-width="0.6"/>` +
+    `<g>${isMoving ? `<animateTransform attributeName="transform" type="rotate" values="0;360" dur="0.6s" repeatCount="indefinite"/>` : ''}` +
+    `<rect x="-0.3" y="${-r + 0.6}" width="0.6" height="${2 * r - 1.2}" fill="#c9a24a"/><rect x="${-r + 0.6}" y="-0.3" width="${2 * r - 1.2}" height="0.6" fill="#c9a24a"/></g>` +
+    `<circle r="0.9" fill="#f2c14e"/></g>`
+
+  const cars = Array.from({ length: n }, (_, i) => {
+    const x = x0 + i * (CAR_W + 2)
+    const hero = party[i]
+    const window = hero
+      ? `<rect x="${x + 4}" y="17" width="22" height="13" fill="#232c5c"/>` + bust(hero.name, x + 5, 17.5, 20, 12.5)
+      : `<rect x="${x + 4}" y="17" width="22" height="13" fill="#141a3a"/>` + STAR(x + 15, 23, 0x5a6aa8)
+    return (
+      `<rect x="${x + 1}" y="11" width="${CAR_W - 2}" height="3" fill="#2a2f55"/>` +
+      `<rect x="${x}" y="14" width="${CAR_W}" height="1" fill="#c9a24a"/>` +
+      `<rect x="${x}" y="15" width="${CAR_W}" height="21" fill="#efe6d2"/>` +
+      `<rect x="${x}" y="30" width="${CAR_W}" height="1" fill="#c9a24a"/>` +
+      `<rect x="${x}" y="31" width="${CAR_W}" height="5" fill="#7a1f2b"/>` +
+      window +
+      `<rect x="${x + 4}" y="17" width="22" height="13" fill="none" stroke="#c9a24a" stroke-width="0.8"/>` +
+      `<rect x="${x + CAR_W}" y="33" width="2" height="1.5" fill="#3a3a48"/>` +
+      wheel(x + 7, 37, 3.2) +
+      wheel(x + CAR_W - 7, 37, 3.2)
+    )
+  }).join('')
+
+  const L = loco
+  const puffs = isMoving
+    ? [0, 1, 2, 3]
+        .map(
+          i =>
+            `<g opacity="0"><g>${motion([[0, L + 28, 9], [1.6, L + 14, -2]], 1.6, -i * 0.4)}<circle r="2.4" fill="#e9e6ff"/><circle cx="1.6" cy="-0.6" r="0.5" fill="#f2c14e"/></g>${fade('0;0.85;0', 1.6, -i * 0.4)}</g>`,
+        )
+        .join('')
+    : ''
+  const locomotive =
+    `<rect x="${L}" y="11" width="16" height="3" fill="#2a2f55"/>` +
+    `<rect x="${L}" y="14" width="15" height="22" fill="#efe6d2"/>` +
+    `<rect x="${L + 3}" y="16.5" width="9" height="7" fill="#f6d27c"/><rect x="${L + 3}" y="16.5" width="9" height="7" fill="none" stroke="#c9a24a" stroke-width="0.8"/>` +
+    `<rect x="${L}" y="30" width="15" height="1" fill="#c9a24a"/><rect x="${L}" y="31" width="15" height="5" fill="#7a1f2b"/>` +
+    `<rect x="${L + 15}" y="19" width="20" height="17" fill="#7a1f2b"/><rect x="${L + 15}" y="19" width="20" height="2" fill="#9b2f3d"/>` +
+    `<rect x="${L + 19}" y="19" width="1.5" height="17" fill="#c9a24a"/><rect x="${L + 28}" y="19" width="1.5" height="17" fill="#c9a24a"/>` +
+    `<rect x="${L + 21}" y="15.5" width="5" height="3.5" fill="#f2c14e"/>` +
+    `<rect x="${L + 27}" y="12" width="4" height="7" fill="#2a2f55"/><rect x="${L + 26}" y="11" width="6" height="1.5" fill="#f2c14e"/>` +
+    `<rect x="${L + 35}" y="18" width="3" height="18" fill="#c9a24a"/>` +
+    `<circle cx="${L + 37}" cy="23" r="5" fill="#fff3b0" opacity="0.3">${isMoving ? `<animate attributeName="opacity" values="0.2;0.45;0.2" dur="1.2s" repeatCount="indefinite"/>` : ''}</circle>` +
+    `<circle cx="${L + 37}" cy="23" r="1.8" fill="#fff6c8"/>` +
+    `<polygon points="${L + 30},36 ${L + 38},36 ${L + 41},40 ${L + 30},40" fill="#a8802a"/>` +
+    STAR(L + 24, 27, 0xf2c14e) +
+    wheel(L + 7, 37, 3.2) +
+    wheel(L + 20, 36.5, 3.8) +
+    wheel(L + 30, 36.5, 3.8)
+
+  const body = anim(cars + locomotive, [[0, 0, 0], [0.25, 0, -0.4], [0.5, 0, 0]], 0.5)
+  return {
+    source: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${SCENE_H}" shape-rendering="crispEdges">${sky}${rail}${puffs}${body}</svg>`,
+    width,
+  }
+}
+
+// A hero's card while they work: their kit on a loop, Basic ATK, then Skill, then Ultimate, each named as it plays.
+const LOOP = 6
+const PHASES: [number, number][] = [
+  [0, 1.6],
+  [1.6, 3.4],
+  [3.4, LOOP],
 ]
 
-const BALL_LOW = { 12: '..............bb', 13: '.............bkbb', 14: '.............bbkb', 15: '..............bb' }
+function phase(i: number, inner: string): string {
+  const [from, to] = PHASES[i]!
+  return `<g opacity="0">${inner}${blink(from, to, LOOP)}</g>`
+}
 
-const GEAR: { name: string; rows: Record<number, string> }[] = [
-  { name: 'headband', rows: { 3: '...wwwwwwwwwww', 4: '.............ww' } },
-  { name: 'backwards cap', rows: { 1: '....cccccccc', 2: '...cccccccccc', 3: '.............ccc' } },
-  { name: 'goggles', rows: { 4: '..gegggggggegg' } },
-  { name: 'crown', rows: { 0: '....y..yy..y', 1: '....yyyyyyyy', 2: '....yryyyyry' } },
-  {
-    name: 'ball spin',
-    rows: { 0: '.............bb', 1: '............bbkb', 2: '............bkbb', 3: '.............bb', 4: '.............o', 5: '.............o', 6: '.............o', 7: '.............  ', 8: '.............  ' },
-  },
-  { name: 'wristbands', rows: { 8: '.w............w', ...BALL_LOW } },
-  { name: 'headphones', rows: { 2: '...kkkkkkkkkk', 3: '..k..........k', 4: '..r..........r', 5: '..r..........r' } },
-  { name: 'afro', rows: { 0: '....aaaaaaaa', 1: '...aaaaaaaaaa', 2: '..aaaaaaaaaaaa', 3: '..a..........a' } },
-]
+const spin = (dur: number) => `dur="${dur}s" repeatCount="indefinite"`
 
-const NUMBERS = [23, 33, 0, 8, 7, 24, 91, 30, 1, 34, 3, 6]
-const POSITIONS = ['PG', 'SG', 'SF', 'PF', 'C']
+function hexagon(r: number): string {
+  return Array.from({ length: 6 }, (_, k) => {
+    const a = (Math.PI / 3) * k + Math.PI / 6
+    return `${(r * Math.cos(a)).toFixed(1)},${(r * Math.sin(a)).toFixed(1)}`
+  }).join(' ')
+}
+
+function chain(path: Key[], total: number, count: number, colors: number[], gap: number, size: (j: number) => number = j => (j === 0 ? 3 : j < 4 ? 2 : 1.5)): string {
+  return Array.from({ length: count }, (_, j) => `<g>${motion(path, total, -j * gap)}${px(-size(j) / 2, -size(j) / 2, size(j), colors[j % colors.length]!)}</g>`)
+    .reverse()
+    .join('')
+}
+
+function butterfly(color: number, dark: number): string {
+  return (
+    `<g><animateTransform attributeName="transform" type="scale" values="1 1;0.2 1;1 1" ${spin(0.3)}/>` +
+    `${px(-2, -1.5, 2, color)}${px(0, -1.5, 2, color)}${px(-1.5, 0.5, 1.5, dark)}${px(0, 0.5, 1.5, dark)}</g>`
+  )
+}
+
+function effects(hero: Hero): { before: string; after: string; body: Key[]; ultBody?: string } {
+  if (hero.name === 'Imbibitor Lunae') {
+    const slash = (d: string, from: number, to: number) =>
+      `<g opacity="0"><path d="${d}" fill="none" stroke="#7ff3e2" stroke-width="1.6" stroke-linecap="round" shape-rendering="geometricPrecision"/>${blink(from, to, LOOP)}</g>`
+    const scale = (x: number, from: number) =>
+      `<g opacity="0"><polygon points="${x},-6 ${x + 2},-3.5 ${x},-1 ${x - 2},-3.5" fill="#5fe3d2" stroke="#e9fffb" stroke-width="0.4"/>${blink(from, 3.4, LOOP)}</g>`
+    const loop: Key[] = Array.from({ length: 25 }, (_, k) => {
+      const a = (k / 24) * Math.PI * 2
+      return [(k / 24) * 1.4, 16 + 24 * Math.cos(a), 20 + 9 * Math.sin(a) - 5 * Math.sin(2 * a)]
+    })
+    return {
+      before: phase(2, `<circle cx="34" cy="-2" r="12" fill="#f8eeb0" opacity="0.2"/><circle cx="34" cy="-2" r="8" fill="#f8eeb0" opacity="0.9"/>`),
+      after:
+        slash('M30 4 Q44 14 32 30', 0.15, 0.6) +
+        slash('M33 8 Q46 20 34 34', 0.6, 1.05) +
+        slash('M28 12 Q42 22 30 38', 1.05, 1.55) +
+        scale(8, 1.7) +
+        scale(16, 1.9) +
+        scale(24, 2.1) +
+        `<g opacity="0"><g>${motion([[0, -8, 0], [2.5, -8, 0], [2.9, 12, 0], [LOOP, 12, 0]], LOOP)}<rect x="16" y="20" width="22" height="1.5" fill="#f6d27c"/><polygon points="38,18.5 43,20.75 38,23" fill="#e9fffb"/></g>${blink(2.5, 3.3, LOOP)}</g>` +
+        phase(2, chain(loop, 1.4, 12, [0xe9fffb, 0x5fe3d2, 0x2aa69c], 0.06)),
+      body: [[0, 0, 0], [0.3, 2, 0], [1.5, 2, 0], [1.6, 0, 0], [2.5, 0, 0], [2.7, 3, -1], [3.3, 0, 0], [3.6, 0, -3], [5.6, 0, -3], [LOOP, 0, 0]],
+    }
+  }
+  if (hero.name === 'Permansor Terrae') {
+    const burst = (r: number) =>
+      `<polygon points="${Array.from({ length: 16 }, (_, k) => {
+        const a = (Math.PI / 8) * k
+        const rr = k % 2 ? r / 2.5 : r
+        return `${(40 + rr * Math.cos(a)).toFixed(1)},${(20 + rr * Math.sin(a)).toFixed(1)}`
+      }).join(' ')}" fill="#f2c14e"/>`
+    const dive: Key[] = [[0, 46, -14], [0.5, 30, 8], [0.8, 16, 36], [2.6, 16, 36]]
+    const shards = [-6, 4, 26, 38]
+      .map((x, i) => `<g opacity="0"><g>${motion([[0, x, 40], [3.4 + 0.8, x, 40], [3.4 + 1.4, x + (i % 2 ? 4 : -4), 24], [LOOP, x + (i % 2 ? 4 : -4), 24]], LOOP)}<rect width="2.5" height="2" fill="#8a6a3a"/></g>${blink(4.2, 5.2, LOOP)}</g>`)
+      .join('')
+    return {
+      before: phase(
+        1,
+        `<g transform="translate(16 20)"><polygon points="${hexagon(24)}" fill="#f2c14e" fill-opacity="0.12" stroke="#f2c14e" stroke-width="1" shape-rendering="geometricPrecision"/></g>`,
+      ),
+      after:
+        `<g opacity="0">${burst(5)}${blink(0.5, 0.8, LOOP)}</g><g opacity="0">${burst(8)}${blink(0.8, 1.2, LOOP)}</g>` +
+        phase(1, `<polygon points="16,-9 18.5,-6 16,-3 13.5,-6" fill="#f2c14e" stroke="#fff1c0" stroke-width="0.4"/>`) +
+        phase(1, `<g>${chain([[0, 36, 30], [0.4, 40, 22], [0.8, 36, 14], [1.2, 40, 6], [1.6, 36, -2]], 1.6, 7, [0xfff1c0, 0x3fc7b5, 0xf2c14e], 0.08)}</g>`) +
+        phase(2, `<g>${chain(dive.map(([t, x, y]) => [t, x, y] as Key), 2.6, 12, [0xfff1c0, 0xf2c14e, 0xd9a63a], 0.05, j => (j === 0 ? 4 : j < 5 ? 3 : 2))}</g>`) +
+        `<g opacity="0"><ellipse cx="16" cy="40" rx="4" ry="1.5" fill="none" stroke="#f2c14e" stroke-width="1" shape-rendering="geometricPrecision"><animate attributeName="rx" values="4;4;30;30" keyTimes="0;${(4.2 / LOOP).toFixed(3)};${(5.2 / LOOP).toFixed(3)};1" dur="${LOOP}s" repeatCount="indefinite"/></ellipse>${blink(4.2, 5.4, LOOP)}</g>` +
+        shards +
+        phase(2, `<g transform="translate(16 20)"><polygon points="${hexagon(22)}" fill="none" stroke="#fff1c0" stroke-width="0.6" stroke-dasharray="2 2" shape-rendering="geometricPrecision"/></g>`),
+      body: [[0, 0, 0], [0.3, 0, 0], [0.5, 4, 0], [1.2, 4, 0], [1.5, 0, 0], [4.0, 0, 0], [4.2, 0, 1], [4.4, 0, 0], [LOOP, 0, 0]],
+    }
+  }
+  if (hero.name === 'Castorice') {
+    const ripple = (begin: number) =>
+      `<g opacity="0"><ellipse cx="36" cy="22" rx="2" ry="4" fill="none" stroke="#b784ea" stroke-width="0.8" shape-rendering="geometricPrecision"><animate attributeName="rx" values="2;8" dur="0.6s" begin="${begin}s" repeatCount="indefinite"/><animate attributeName="ry" values="4;12" dur="0.6s" begin="${begin}s" repeatCount="indefinite"/></ellipse>${blink(0.1, 1.5, LOOP)}</g>`
+    const flies = [10, 18, 26, 14, 30]
+      .map((y, i) => {
+        const keys: Key[] = [[0, 20, 18], [1.6 + i * 0.12, 20, 18], [2.6 + i * 0.12, 44, y], [LOOP, 44, y]]
+        return `<g opacity="0"><g>${motion(keys, LOOP)}${butterfly(0xc996ff, 0x8650d4)}</g>${blink(1.6 + i * 0.12, 3.3, LOOP)}</g>`
+      })
+      .join('')
+    const flowers = [-6, 2, 30, 38, 12]
+      .map(x => `${px(x, 38, 1, 0xffffff)}${px(x - 1, 39, 1, 0xc996ff)}${px(x + 1, 39, 1, 0xc996ff)}`)
+      .join('')
+    const wing = (dir: number) =>
+      `<polygon points="16,6 ${16 + dir * 26},-10 ${16 + dir * 24},4 ${16 + dir * 28},12 ${16 + dir * 10},16" fill="#2c1840" fill-opacity="0.85" stroke="#e8dcf5" stroke-width="0.6" shape-rendering="geometricPrecision"/>` +
+      `<path d="M16 6 L${16 + dir * 26} -10 M16 8 L${16 + dir * 24} 4 M16 10 L${16 + dir * 28} 12" stroke="#e8dcf5" stroke-width="0.5" shape-rendering="geometricPrecision"/>`
+    const netherwing =
+      `<g opacity="0"><g>${motion([[0, 0, 14], [3.4, 0, 14], [4.2, 0, 0], [LOOP, 0, 0]], LOOP)}` +
+      wing(-1) +
+      wing(1) +
+      `<polygon points="11,-13 21,-13 23,-7 19,-3 13,-3 9,-7" fill="#ece4f6"/>${px(12.5, -10, 2, 0x7b4fb0)}${px(17.5, -10, 2, 0x7b4fb0)}` +
+      `<rect x="13" y="-4" width="6" height="1" fill="#2c1840"/></g>${blink(3.4, LOOP, LOOP)}</g>`
+    return {
+      before: phase(2, `<ellipse cx="16" cy="40" rx="30" ry="4" fill="#6b3a9c" opacity="0.55"/>${flowers}`) + netherwing,
+      after: ripple(0) + ripple(0.3) + flies,
+      body: [[0, 0, 0], [0.2, 1, 0], [1.4, 1, 0], [1.6, 0, 0], [3.4, 0, 0], [4.0, 0, -2], [5.8, 0, -2], [LOOP, 0, 0]],
+    }
+  }
+  if (hero.name === 'Firefly') {
+    const jet = [0, 1, 2, 3, 4, 5]
+      .map(i => {
+        const c = [0x7ff0c8, 0xf2a03a, 0xd4f26a][i % 3]!
+        return `<g opacity="0"><g>${motion([[0, 28, 18 + (i % 3)], [0.5, 46, 16 + (i % 4)]], 0.5, -i * 0.08)}<rect width="3" height="2" fill="${hex(c)}"/></g>${blink(0.2, 1.5, LOOP)}</g>`
+      })
+      .join('')
+    const impact = [-4, 2, 8, 24, 30, 36]
+      .map((x, i) => `<g opacity="0"><g>${motion([[0, x, 40], [0.6, x + (i % 2 ? 1 : -1), 26]], 0.6, -i * 0.1)}<rect width="2" height="3" fill="${hex([0x7ff0c8, 0xd4f26a, 0x3fd0a0][i % 3]!)}"/></g>${blink(2.7, 3.4, LOOP)}</g>`)
+      .join('')
+    const flameWing = (dir: number) =>
+      `<polygon points="16,14 ${16 + dir * 30},-8 ${16 + dir * 22},6 ${16 + dir * 32},10 ${16 + dir * 18},18 ${16 + dir * 26},28 16,24" fill="#6ff7d0" fill-opacity="0.55" stroke="#c8fff0" stroke-width="0.5" shape-rendering="geometricPrecision"><animate attributeName="fill-opacity" values="0.35;0.7;0.35" ${spin(0.5)}/></polygon>`
+    const rising = [-6, 0, 6, 26, 32, 38]
+      .map((x, i) => `<g opacity="0"><g>${motion([[0, x, 40], [1, x, 8]], 1, -i * 0.17)}<rect width="2" height="3" fill="${hex([0x7ff0c8, 0xd4f26a][i % 2]!)}"/></g>${fade('0;1;0', 1, -i * 0.17)}</g>`)
+      .join('')
+    return {
+      before: phase(2, flameWing(-1) + flameWing(1)),
+      after: jet + impact + phase(2, rising),
+      body: [[0, 0, 0], [1.6, 0, 0], [2.2, 2, -14], [2.5, 2, -14], [2.7, 0, 0], [3.4, 0, 0], [3.8, 0, -2], [5.8, 0, -2], [LOOP, 0, 0]],
+      ultBody: 'SAM',
+    }
+  }
+  return { before: '', after: '', body: [[0, 0, 0], [LOOP, 0, 0]] }
+}
+
+function cardSvg(hero: Hero, isLive: boolean): string {
+  const wrap = (inner: string) =>
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-12 -14 56 58" shape-rendering="crispEdges"><rect x="-12" y="40" width="56" height="1" fill="${hex(hero.accent)}" opacity="0.4"/>${inner}</svg>`
+  if (!isLive || hero.kit === undefined) {
+    return wrap(bigSprite(hero.name))
+  }
+  const fx = effects(hero)
+  // Firefly fights as SAM, her armor; the other heroes fight as themselves.
+  const body = `<g>${motion(fx.body, LOOP)}${bigSprite(fx.ultBody ?? hero.name)}</g>`
+  const title = (i: number, tag: string) => {
+    const name = hero.kit![i]!
+    const fit = name.length > 18 ? ` textLength="54" lengthAdjust="spacingAndGlyphs"` : ''
+    return phase(
+      i,
+      `<text x="16" y="-9" text-anchor="middle" font-size="3.4" font-family="ui-monospace, Menlo, monospace" fill="#8d94b8" letter-spacing="0.6">${tag}</text>` +
+        `<text x="16" y="-4" text-anchor="middle" font-size="4.6" font-weight="700" font-family="ui-sans-serif, system-ui" fill="${hex(hero.accent)}"${fit}>${name.replace(/&/g, '&amp;')}</text>`,
+    )
+  }
+  return wrap(fx.before + body + fx.after + title(0, 'BASIC ATK') + title(1, 'SKILL') + title(2, 'ULTIMATE'))
+}
+
+// The pane's header, styled after Star Rail's battle screen: action order, trailblaze time, victories and defeats,
+// skill points for the heroes at work, and the tokens spent.
+type Board = { wins: number; losses: number; clock: string; roster: number; tokens: string; party: Hero[] }
 
 const DIGITS = [
   ['111', '101', '101', '101', '111'],
@@ -103,187 +321,6 @@ const DIGITS = [
   ['111', '101', '111', '101', '111'],
   ['111', '101', '111', '001', '111'],
 ]
-
-// Row-major, W×H; null is see-through.
-type Player = { number: number; position: string; gear: string; pixels: (number | null)[] }
-
-function player(spot: number): Player {
-  const number = NUMBERS[spot % NUMBERS.length]!
-  const gear = GEAR[spot % GEAR.length]!
-  const pixels: (number | null)[] = Array<number | null>(W * H).fill(null)
-  const paint = (rows: Record<number, string>) => {
-    for (const [y, line] of Object.entries(rows)) {
-      ;[...line].forEach((ch, x) => {
-        if (ch === ' ') pixels[+y * W + x] = null
-        else if (ch !== '.') pixels[+y * W + x] = PALETTE[ch] ?? null
-      })
-    }
-  }
-  paint(Object.fromEntries(BODY.map((line, y) => [y, line])))
-  const digits = String(number).split('').map(Number)
-  const left = digits.length === 1 ? 6 : 4
-  digits.forEach((d, i) =>
-    DIGITS[d]!.forEach((line, y) =>
-      [...line].forEach((bit, x) => {
-        if (bit === '1') pixels[(7 + y) * W + left + i * 4 + x] = PALETTE.n!
-      }),
-    ),
-  )
-  paint(gear.rows)
-
-  return { number, position: POSITIONS[spot % POSITIONS.length]!, gear: gear.name, pixels }
-}
-
-function hex(color: number): string {
-  return `#${color.toString(16).padStart(6, '0')}`
-}
-
-// The strip's court: whoever is on court passes down the line and the last player drives in and dunks, on a loop.
-const COURT_H = 24
-const FEET = 7 // sprite top, so its feet sit on the floor at y 23
-const SLOT = 24
-const BALL = ['.bb.', 'bkbb', 'bbkb', '.bb.']
-
-type Key = [t: number, x: number, y: number]
-
-function rects(pixels: (number | null)[], width: number): string {
-  return pixels
-    .flatMap((c, i) => (c === null ? [] : [`<rect x="${i % width}" y="${Math.floor(i / width)}" width="1" height="1" fill="${hex(c)}"/>`]))
-    .join('')
-}
-
-function motion(keys: Key[], total: number): string {
-  const times = keys.map(([t]) => (t / total).toFixed(4)).join(';')
-  const values = keys.map(([, x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join(';')
-  return `<animateTransform attributeName="transform" type="translate" values="${values}" keyTimes="${times}" dur="${total.toFixed(2)}s" repeatCount="indefinite"/>`
-}
-
-function court(spots: number[], isLive: boolean): { source: string; width: number } {
-  const n = Math.max(1, spots.length)
-  const hoop = 4 + n * SLOT + 30
-  const width = hoop + 4
-  const rimC = hoop - 5
-  const left = (i: number) => 4 + i * SLOT
-  const hand = (i: number, dx = 0, dy = 0): [number, number] => [left(i) + 15 + dx, FEET + 8 + dy]
-  const FLOOR = 21.5
-
-  const ball: Key[] = []
-  const moves: Key[][] = spots.map(() => [])
-  let t = 0
-  if (isLive) {
-    const DRIBBLE = 0.8
-    const PASS = 0.45
-    for (let i = 0; i < n; i++) {
-      const [x, y] = hand(i)
-      ball.push([t, x, y], [t + DRIBBLE / 4, x, FLOOR], [t + DRIBBLE / 2, x, y], [t + (3 * DRIBBLE) / 4, x, FLOOR], [t + DRIBBLE, x, y])
-      t += DRIBBLE
-      if (i < n - 1) {
-        const [x2, y2] = hand(i + 1)
-        ball.push([t + PASS / 2, (x + x2) / 2, y - 6], [t + PASS, x2, y2])
-        t += PASS
-      }
-    }
-    // The drive: a running jump to the rim, the slam, a hang, the drop, the jog back.
-    const last = n - 1
-    const dx = rimC - hand(last)[0]
-    const lift: Key[] = [[t, 0, 0], [t + 0.3, dx * 0.6, -9], [t + 0.5, dx, -7]]
-    lift.forEach(([k, mx, my]) => ball.push([k, ...hand(last, mx, my)]))
-    ball.push([t + 0.62, rimC, 2], [t + 0.75, rimC, 9], [t + 0.95, rimC, FLOOR], [t + 1.15, rimC - 4, FLOOR - 3], [t + 1.35, rimC - 8, FLOOR])
-    moves[last]!.push(...lift, [t + 0.95, dx, -7], [t + 1.15, dx, 0], [t + 1.8, 0, 0])
-    t += 1.8
-    ball.push([t + 0.4, ...hand(0)])
-    t += 0.4
-  }
-  const total = Math.max(t, 1)
-
-  const players = spots
-    .map((spot, i) => {
-      const keys = moves[i]!
-      const anim = isLive && keys.length > 0 ? motion([[0, 0, 0], ...keys, [total, 0, 0]], total) : ''
-      return `<g transform="translate(${left(i)} ${FEET})"><g>${anim}${rects(player(spot).pixels, W)}</g></g>`
-    })
-    .join('')
-
-  const ballPixels = BALL.flatMap(line => [...line].map(ch => (ch === '.' ? null : PALETTE[ch]!)))
-  const rest = isLive ? hand(0) : [left(0) + 18, FLOOR]
-  const ballAnim = isLive ? motion([...ball, [total, ...hand(0)]], total) : ''
-  const ballSvg = `<g transform="translate(-2 -2)"><g transform="translate(${rest[0]} ${rest[1]})">${ballAnim}${rects(ballPixels, 4)}</g></g>`
-
-  const net = [0, 2, 4].map(k => `<rect x="${rimC - 2 + k}" y="9" width="1" height="2" fill="#d8d8d8" opacity="0.7"/>`).join('')
-  const scene =
-    `<rect x="0" y="23" width="${width}" height="1" fill="#b07a45"/>` +
-    `<rect x="${hoop}" y="1" width="2" height="22" fill="#6b6b6b"/>` +
-    `<rect x="${hoop - 1}" y="1" width="1" height="9" fill="#f5f5f5"/>` +
-    `<rect x="${rimC - 3}" y="8" width="7" height="1" fill="#e8452c"/>` +
-    net
-
-  return {
-    source: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${COURT_H}" shape-rendering="crispEdges">${scene}${players}${ballSvg}</svg>`,
-    width,
-  }
-}
-
-// A working player's card runs one move on a loop, picked by roster spot.
-const MOVES = ['dribble', 'crossover', 'jump shot', 'spin move', 'between the legs'] as const
-
-function moveOf(spot: number): (typeof MOVES)[number] {
-  return MOVES[spot % MOVES.length]!
-}
-
-function moveSvg(p: Player, spot: number, isLive: boolean): string {
-  const body = rects(p.pixels, W)
-  const ballPixels = BALL.flatMap(line => [...line].map(ch => (ch === '.' ? null : PALETTE[ch]!)))
-  const ball = (keys: Key[], total: number, extra = '') =>
-    `<g transform="translate(-2 -2)"><g>${motion(keys, total)}${extra}${rects(ballPixels, 4)}</g></g>`
-  const floor = '<rect x="-4" y="16" width="26" height="1" fill="#b07a45" opacity="0.6"/>'
-  const wrap = (inner: string) =>
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 -8 26 25" shape-rendering="crispEdges">${floor}${inner}</svg>`
-  const move = moveOf(spot)
-
-  if (!isLive) {
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 -8 26 25" shape-rendering="crispEdges">${body}</svg>`
-  }
-  if (move === 'dribble') {
-    const T = 0.5
-    return wrap(
-      `<g>${motion([[0, 0, 0], [T / 2, 0, 0.6], [T, 0, 0]], T)}${body}</g>` +
-        ball([[0, 16, 9], [T / 2, 16, 14.5], [T, 16, 9]], T),
-    )
-  }
-  if (move === 'crossover') {
-    const T = 1.2
-    return wrap(
-      `<g>${motion([[0, 0, 0], [0.3, -1, 0.6], [0.6, 0, 0], [0.9, 1, 0.6], [T, 0, 0]], T)}${body}</g>` +
-        ball([[0, 17, 9], [0.15, 13, 14.5], [0.3, 1, 9], [0.45, 1, 14.5], [0.6, 1, 9], [0.75, 5, 14.5], [0.9, 17, 9], [1.05, 17, 14.5], [T, 17, 9]], T),
-    )
-  }
-  if (move === 'jump shot') {
-    const T = 1.8
-    const jump = motion([[0, 0, 0], [0.3, 0, 0.8], [0.55, 0, -5], [0.75, 0, -5], [1.0, 0, 0], [T, 0, 0]], T)
-    const fade = `<animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0;0.6;0.62;0.95;1" dur="${T}s" repeatCount="indefinite"/>`
-    return wrap(
-      `<g>${jump}${body}</g>` +
-        ball([[0, 15, 8], [0.3, 15, 8.8], [0.55, 15, 0], [0.75, 15, -2], [0.95, 21, -9], [1.1, 26, -6], [1.7, 26, -6], [T, 15, 8]], T, fade),
-    )
-  }
-  if (move === 'spin move') {
-    const T = 1.0
-    const show = (a: string) => `<animate attributeName="opacity" values="${a}" keyTimes="0;0.25;0.5;0.75;1" calcMode="discrete" dur="${T}s" repeatCount="indefinite"/>`
-    const slide = motion([[0, -1, 0], [0.5, 1, 0], [T, -1, 0]], T)
-    return wrap(
-      `<g>${slide}<g>${show('1;0;1;0;1')}${body}</g><g transform="translate(18 0) scale(-1 1)"><g>${show('0;1;0;1;0')}${body}</g></g></g>` +
-        ball([[0, 16, 9], [0.25, 16, 14.5], [0.5, 2, 9], [0.75, 2, 14.5], [T, 16, 9]], T),
-    )
-  }
-  const T = 1.0
-  return wrap(
-    `<g>${motion([[0, 0, 0], [0.25, 0, 1], [0.5, 0, 0], [0.75, 0, 1], [T, 0, 0]], T)}${body}</g>` +
-      ball([[0, 16, 10], [0.25, 8, 15], [0.5, 1, 10], [0.75, 8, 15], [T, 16, 10]], T),
-  )
-}
-
-// The pane's header: an arena scoreboard in dot-matrix LEDs. Home is Team Claude's wins, away the bugs' (failed or stopped runs).
-type Board = { wins: number; losses: number; clock: string; roster: number; tokens: string; lights: boolean[] }
 
 function led(text: string, cx: number, top: number, pitch: number, on: string, off: string): string {
   const widthOf = (ch: string) => (ch === ':' ? 2 : 4) * pitch
@@ -304,48 +341,91 @@ function led(text: string, cx: number, top: number, pitch: number, on: string, o
   return out.join('')
 }
 
+const EMBLEM = (cx: number, cy: number, r: number, color: string) =>
+  `<polygon points="${Array.from({ length: 16 }, (_, k) => {
+    const a = (Math.PI / 8) * k - Math.PI / 2
+    const rr = k % 2 ? r * 0.38 : k % 4 ? r * 0.7 : r
+    return `${(cx + rr * Math.cos(a)).toFixed(1)},${(cy + rr * Math.sin(a)).toFixed(1)}`
+  }).join(' ')}" fill="${color}"/>`
+
 function scoreboard(b: Board): string {
-  const AMBER = '#ffb020'
-  const AMBER_OFF = '#2b1d08'
-  const RED = '#ff4433'
-  const RED_OFF = '#2d0f0c'
-  const label = (x: number, y: number, text: string, fill = '#8a8a8a', size = 7, weight = 600) =>
-    `<text x="${x}" y="${y}" fill="${fill}" font-size="${size}" font-weight="${weight}" font-family="ui-monospace, Menlo, monospace" text-anchor="middle" letter-spacing="1">${text}</text>`
-  const panel = (x: number, w: number) => `<rect x="${x}" y="10" width="${w}" height="68" rx="4" fill="#111" stroke="#262626"/>`
-  const lights = b.lights
-    .slice(0, 8)
-    .map((isOn, i) => `<circle cx="${30 + i * 8}" cy="88" r="2.4" fill="${isOn ? '#3ddc84' : '#1f3326'}"/>`)
+  const GOLD = '#f2c14e'
+  const CYAN = '#5fe3d2'
+  const FONT = 'font-family="ui-monospace, Menlo, monospace"'
+  const label = (x: number, y: number, text: string, fill = '#8d94b8', size = 5.5, anchor = 'middle') =>
+    `<text x="${x}" y="${y}" fill="${fill}" font-size="${size}" font-weight="600" ${FONT} text-anchor="${anchor}" letter-spacing="1">${text}</text>`
+  const panel = (x: number, w: number) =>
+    `<rect x="${x}" y="24" width="${w}" height="52" rx="2" fill="#0f1430" fill-opacity="0.85" stroke="#c9a24a" stroke-opacity="0.45"/>` +
+    `<polygon points="${x + w / 2},22 ${x + w / 2 + 2},24 ${x + w / 2},26 ${x + w / 2 - 2},24" fill="${GOLD}"/>`
+  const stars = [[24, 30], [70, 84], [130, 6], [196, 88], [250, 30], [300, 52], [12, 60], [306, 82], [160, 96], [100, 4]]
+    .map(([x, y], i) => `<circle cx="${x}" cy="${y}" r="${i % 3 ? 0.6 : 0.9}" fill="#ffffff" opacity="0.6"/>`)
     .join('')
+  const corner = (x: number, y: number) => `<polygon points="${x},${y - 3} ${x + 3},${y} ${x},${y + 3} ${x - 3},${y}" fill="${GOLD}"/>`
+
+  const order = b.party.length
+    ? b.party
+        .slice(0, 4)
+        .map((hero, i) => {
+          const x = 13 + i * 26
+          return (
+            `<rect x="${x}" y="36" width="22" height="18" fill="#1b2350" stroke="${hex(hero.accent)}" stroke-width="0.8"/>` +
+            bust(hero.name, x + 0.5, 36.5, 21, 17, '4 2 24 19') +
+            `<rect x="${x}" y="56" width="22" height="2" fill="${hex(hero.accent)}"/>`
+          )
+        })
+        .join('')
+    : label(62, 52, 'STANDBY', '#5a6290', 7)
+  const points = Array.from({ length: 5 }, (_, i) => {
+    const x = 66 + i * 9
+    const isOn = i < Math.min(5, b.party.length)
+    return `<polygon points="${x},84 ${x + 3},87.5 ${x},91 ${x - 3},87.5" fill="${isOn ? CYAN : '#16304a'}" stroke="${GOLD}" stroke-width="0.5"/>`
+  }).join('')
+
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="200" viewBox="0 0 320 100">` +
-    `<rect x="1" y="1" width="318" height="98" rx="8" fill="#070707" stroke="#333"/>` +
-    panel(8, 84) +
-    panel(100, 120) +
-    panel(228, 84) +
-    label(50, 21, 'HOME') +
-    label(50, 32, 'CLAUDE', '#d97757', 9, 800) +
-    led(String(b.wins).padStart(2, '0'), 50, 40, 6, AMBER, AMBER_OFF) +
-    label(160, 21, 'GAME CLOCK') +
-    led(b.clock, 160, 34, 6.5, RED, RED_OFF) +
-    label(160, 74, `ROSTER ${b.roster}`, AMBER, 7) +
-    label(270, 21, 'AWAY') +
-    label(270, 32, 'BUGS', '#9aa4ff', 9, 800) +
-    led(String(b.losses).padStart(2, '0'), 270, 40, 6, AMBER, AMBER_OFF) +
-    `<text x="12" y="90.5" fill="#8a8a8a" font-size="6" font-family="ui-monospace, Menlo, monospace" letter-spacing="1">ON</text>` +
-    lights +
-    `<text x="308" y="90.5" fill="${AMBER}" font-size="7" font-weight="600" font-family="ui-monospace, Menlo, monospace" text-anchor="end" letter-spacing="1">TOKENS ${b.tokens.toUpperCase()}</text>` +
+    `<defs><linearGradient id="night" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1a1f4a"/><stop offset="1" stop-color="#070915"/></linearGradient></defs>` +
+    `<rect x="1" y="1" width="318" height="98" rx="4" fill="url(#night)"/>` +
+    stars +
+    `<path d="M-10 92 Q160 62 330 92" fill="none" stroke="#c9a24a" stroke-opacity="0.25" stroke-width="0.8"/>` +
+    `<rect x="3" y="3" width="314" height="94" rx="3" fill="none" stroke="#c9a24a" stroke-opacity="0.8" stroke-width="0.8"/>` +
+    `<rect x="5" y="5" width="310" height="90" rx="2" fill="none" stroke="#c9a24a" stroke-opacity="0.3" stroke-width="0.5"/>` +
+    corner(3, 3) +
+    corner(317, 3) +
+    corner(3, 97) +
+    corner(317, 97) +
+    EMBLEM(18, 14, 6, GOLD) +
+    `<text x="28" y="17" fill="${GOLD}" font-size="8" font-weight="800" font-family="ui-serif, Georgia, serif" letter-spacing="2">ASTRAL EXPRESS</text>` +
+    label(310, 16.5, 'TRAILBLAZE LOG', '#8d94b8', 5, 'end') +
+    panel(8, 110) +
+    panel(124, 90) +
+    panel(220, 92) +
+    label(63, 32, 'ACTION ORDER') +
+    order +
+    label(169, 32, 'TRAILBLAZE TIME') +
+    led(b.clock, 169, 42, 4.4, CYAN, '#0c2624') +
+    label(169, 72, `PARTY ${b.roster}`, GOLD) +
+    label(243, 32, 'VICTORY', GOLD) +
+    led(String(b.wins).padStart(2, '0'), 243, 42, 4, GOLD, '#2a2110') +
+    label(289, 32, 'DEFEAT', '#e0507a') +
+    led(String(b.losses).padStart(2, '0'), 289, 42, 4, '#e0507a', '#2d0f17') +
+    label(266, 72, 'EXPRESS · BUGS', '#5a6290', 4.5) +
+    label(12, 90, 'SKILL POINTS', '#8d94b8', 5, 'start') +
+    points +
+    `<circle cx="252" cy="87.5" r="4" fill="none" stroke="${CYAN}" stroke-width="1"/><circle cx="252" cy="87.5" r="1.6" fill="${CYAN}"/>` +
+    label(310, 90, `TOKENS ${b.tokens.toUpperCase()}`, GOLD, 5.5, 'end') +
     `</svg>`
   )
 }
 
 // Two pixels per terminal cell: ▀ in the top color over the bottom one.
-function cells(p: Player): string {
+function cells(hero: Hero): string {
+  const pixels = pixelsOf(hero)
   const DEFAULT = 0x01000000
   const words: number[] = []
   for (let y = 0; y < H; y += 2) {
     for (let x = 0; x < W; x++) {
-      const top = p.pixels[y * W + x] ?? null
-      const bottom = p.pixels[(y + 1) * W + x] ?? null
+      const top = pixels[y * W + x] ?? null
+      const bottom = pixels[(y + 1) * W + x] ?? null
       if (top === null && bottom === null) words.push(0x20, DEFAULT, DEFAULT)
       else if (top === null) words.push(0x2584, bottom!, DEFAULT)
       else words.push(0x2580, top, bottom ?? DEFAULT)
@@ -378,7 +458,7 @@ function patch($: EngineInterface, id: string, change: (row: AgentRow) => AgentR
 
 async function openPane($: EngineInterface) {
   await update($, isStripHidden, () => false)
-  const opened = await $.ui.open({ id: PANE, title: 'Team Claude' })
+  const opened = await $.ui.open({ id: PANE, title: 'Astral Express' })
   await update($, isPaneUp, () => opened.isPlaced)
   return opened
 }
@@ -427,9 +507,16 @@ export const register: Register = on => {
       tools: 0,
       lastTool: null,
       tokens: 0,
-      player: await read($, signed),
+      player: 0,
     }
-    await update($, signed, n => n + 1)
+    // An agent whose description names a hero gets that hero; the rest board in roster order.
+    const named = heroNamed(row.description)
+    if (named !== undefined) {
+      row.player = named
+    } else {
+      row.player = await read($, signed)
+      await update($, signed, n => n + 1)
+    }
     await update($, agents, list => [...list, row].slice(-50))
     await update($, isStripHidden, () => false)
     ticker ??= $.clock.every(1000, () => {
@@ -472,7 +559,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The strip: a mini scoreboard while the pane is out of sight, one click from the full roster.
+  // The strip: the Astral Express riding the star rail with the working subagents aboard, one click from the full party.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, agents)
     if (e.props.hasSurvey || list.length === 0 || (await read($, isStripHidden)) || (await read($, isPaneUp))) {
@@ -483,31 +570,33 @@ export const register: Register = on => {
     const finished = list.length - running
     const spent = list.reduce((sum, row) => sum + row.tokens, 0)
     const live = list.filter(row => row.status === 'running')
-    const team = (live.length > 0 ? live : list).slice(-4)
+    // Only the heroes at work ride the Express, the latest four; with none at work it waits on the rail.
+    const party = live.slice(-4)
 
-    const game = () => {
+    const scene = () => {
       if (e.surface === 'terminal') {
-        return team.map(row => (
+        if (party.length === 0) {
+          return <Text dimColor>🚂 parked</Text>
+        }
+        return party.map(row => (
           <Text key={row.id} color={STATUS_COLOR[row.status]}>
-            #{player(spotOf(row, list)).number}
+            {heroOf(spotOf(row, list)).name}
             {STATUS_MARK[row.status]}
           </Text>
         ))
       }
       const { Svg } = $.ui.resolve({ ...e, surface: 'desktop' })
-      const scene = court(
-        team.map(row => spotOf(row, list)),
-        live.length > 0,
-      )
-      const numbers = team.map(row => `#${player(spotOf(row, list)).number}`).join(', ')
+      const heroes = party.map(row => heroOf(spotOf(row, list)))
+      const ride = train(heroes, heroes.length > 0)
+      const names = heroes.map(hero => hero.name).join(', ')
       return (
         <Svg
-          key="court"
-          source={scene.source}
-          alt={live.length > 0 ? `${numbers} playing` : `${numbers} resting after the game`}
-          width={scene.width * 2.5}
-          height={60}
-          isInteractive={live.length > 0}
+          key="express"
+          source={ride.source}
+          alt={heroes.length > 0 ? `The Astral Express riding the star rail with ${names} aboard` : 'The Astral Express waiting on the rail'}
+          width={(ride.width * 64) / SCENE_H}
+          height={64}
+          isInteractive={heroes.length > 0}
         />
       )
     }
@@ -515,19 +604,19 @@ export const register: Register = on => {
     return (
       <Box flexDirection="row" gap={1} alignItems="center">
         <Text weight="semibold" color="claude">
-          🏀 Team Claude
+          ✦ Astral Express
         </Text>
         <Box flexDirection="row" gap={1} alignItems="center">
-          {game()}
+          {scene()}
         </Box>
         <Text color={running > 0 ? 'success' : 'subtle'}>
-          {running} on court · {finished} final
+          {running} aboard · {finished} done
         </Text>
         <Text dimColor tabular>
           {tokens(spent)} tokens
         </Text>
         <Box flexGrow={1} />
-        <Button key="open" label="Open roster" hotkey="a" onPress={() => openPane($)} />
+        <Button key="open" label="Open party" hotkey="a" onPress={() => openPane($)} />
         <Button key="hide" label="×" onPress={() => update($, isStripHidden, () => true)} />
       </Box>
     )
@@ -560,38 +649,36 @@ export const register: Register = on => {
 
     const board = () => {
       const { Svg } = $.ui.resolve({ ...e, surface: 'desktop' })
-      const game = clock(last - first).padStart(5, '0')
+      const time = clock(last - first).padStart(5, '0')
       return (
         <Svg
           key="scoreboard"
           source={scoreboard({
             wins,
             losses,
-            clock: game,
+            clock: time,
             roster: list.length,
             tokens: tokens(spent),
-            lights: list.map(row => row.status === 'running'),
+            party: running.slice(-4).map(row => heroOf(spotOf(row, list))),
           })}
-          alt={`Team Claude ${wins}, Bugs ${losses}, game clock ${game}, ${running.length} on court, ${tokens(spent)} tokens`}
+          alt={`Astral Express ${wins} victories, ${losses} defeats, trailblaze time ${time}, ${running.length} at work, ${tokens(spent)} tokens`}
         />
       )
     }
 
-    const sprite = (row: AgentRow, spot: number) => {
-      const p = player(spot)
+    const sprite = (row: AgentRow, hero: Hero) => {
       if (isTerminal) {
         const { Raster } = $.ui.resolve({ ...e, surface: 'terminal' })
-        return <Raster key={`player-${row.id}`} columns={W} rows={H / 2} cells={cells(p)} />
+        return <Raster key={`hero-${row.id}`} columns={W} rows={H / 2} cells={cells(hero)} />
       }
       const { Svg } = $.ui.resolve({ ...e, surface: 'desktop' })
       const isLive = row.status === 'running'
-      const alt = `#${p.number} ${p.position}, ${p.gear}${isLive ? `, ${moveOf(spot)}` : ''}`
-      return <Svg source={moveSvg(p, spot, isLive)} alt={alt} width={80} height={77} isInteractive={isLive} />
+      const alt = `${hero.name}, ${hero.path}${isLive && hero.kit ? `, using ${hero.kit.join(', then ')}` : ''}`
+      return <Svg source={cardSvg(hero, isLive)} alt={alt} width={96} height={99} isInteractive={isLive} />
     }
 
     const card = (row: AgentRow) => {
-      const spot = spotOf(row, list)
-      const p = player(spot)
+      const hero = heroOf(spotOf(row, list))
       const isLive = row.status === 'running'
       return (
         <Box
@@ -604,7 +691,7 @@ export const register: Register = on => {
           borderDimColor={!isLive}
           paddingX={1}
         >
-          {sprite(row, spot)}
+          {sprite(row, hero)}
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
             <Box flexDirection="row" justifyContent="space-between" gap={1}>
               <Text weight="semibold" wrap="truncate-end">
@@ -616,11 +703,11 @@ export const register: Register = on => {
             </Box>
             <Text wrap="truncate-end">
               <Text weight="bold" color="claude">
-                #{p.number} {p.position}
+                {hero.name}
               </Text>
               <Text dimColor>
                 {' '}
-                {row.type} · {shortModel(row.model)}
+                {hero.path} · {row.type} · {shortModel(row.model)}
                 {row.isBackground ? ' · bg' : ''}
               </Text>
             </Text>
@@ -643,32 +730,32 @@ export const register: Register = on => {
           <Box flexDirection="column" gap={1}>
             <Box flexDirection="row" justifyContent="space-between" alignItems="center">
               <Text weight="bold" color="claude" size="heading">
-                🏀 Team Claude
+                ✦ Astral Express
               </Text>
               <Text dimColor tabular>
                 W {wins} · L {losses}
               </Text>
             </Box>
             <Box flexDirection="row" gap={1}>
-              {stat('Roster', `${list.length}`)}
+              {stat('Party', `${list.length}`)}
               {stat('Tokens', tokens(spent))}
-              {stat('Game clock', clock(last - first))}
+              {stat('Battle time', clock(last - first))}
             </Box>
           </Box>
         ) : (
           board()
         )}
-        {list.length === 0 && <Text dimColor>The bench is empty. Players suit up here as soon as a subagent starts.</Text>}
+        {list.length === 0 && <Text dimColor>The Express is quiet. A Trailblazer boards as soon as a subagent starts.</Text>}
         {running.length > 0 && (
           <Text color="success" weight="semibold" size="caption">
-            On court · {running.length}
+            In battle · {running.length}
           </Text>
         )}
         {running.map(card)}
         {finished.length > 0 && (
           <Box flexDirection="row" justifyContent="space-between" alignItems="center">
             <Text dimColor weight="semibold" size="caption">
-              Final · {finished.length}
+              Done · {finished.length}
             </Text>
             <Button
               key="clear"

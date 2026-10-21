@@ -1,7 +1,7 @@
 {
   "name": "agents-pane",
-  "version": "0.1.0",
-  "description": "A strip above the prompt while subagents run, opening a pane that tracks each one's status, tools, tokens and time.",
+  "version": "0.3.0",
+  "description": "Astral Express: each subagent boards as a Honkai: Star Rail pixel hero; the Express rides above the prompt with the working heroes aboard, and a pane plays each hero's kit while it tracks status, tools, tokens and time.",
   "author": {
     "name": "desmondlee95700",
     "url": "https://github.com/desmondlee95700"
